@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+# Copyright 2012-2013 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# All rights reserved
+
+PROMPT_TTYNUM="8"
+PROMPT_TTY="/dev/tty8"
+
+do_clear() {
+	# Send 'clear' escape sequence
+	echo -e '\033[H\033[J' > ${PROMPT_TTY}
+}
+
+reset_con() {
+	do_clear
+	/sbin/splash "verbose"
+}
+
+READ_TRIES=0
+[[ -n "${MAX_COUNT}" ]] || MAX_COUNT=5
+[[ -n "${MAX_TRIES}" ]] || MAX_TRIES=3
+
+confirm_upgrade() {
+	local whatfor="${1}"
+	local timeout=30
+	local count=0
+	count="$(cat "${COUNT_FILE}")"
+	if [[ $? -eq 0 ]]; then
+		if !expr "${count}" + 1 2>/dev/null 1>/dev/null || [[ $count -lt 0 ]]; then
+			ewarn "Invalid count value: ${count}"
+			count=0
+		fi
+	fi
+
+	clear
+
+	chvt ${PROMPT_TTYNUM}
+	do_clear
+	
+	if [[ -f /usr/local/var/no_keyboard ]]; then
+		printf "Une mise à jour ${whatfor} est disponible\n." > ${PROMPT_TTY}
+		printf "Son installation sera automatique en l'absence de moyen de confirmation (clavier)\n" > ${PROMPT_TTY}
+		reset_con
+		return 0;
+	fi
+
+	
+
+	if [[ ${count} -ge ${MAX_COUNT} ]]; then
+		printf "${HILITE}    Une mise à jour ${whatfor} est disponible\n    Son application a déjà été refusée %d fois.\n    Elle va maintenant être appliquée automatiquement.\n${NORMAL}" ${count} > ${PROMPT_TTY}
+		sleep 5
+		echo -n '0' > "${COUNT_FILE}"
+		reset_con
+		return 0
+	fi
+
+	printf "${GOOD}    Une mise à jour ${whatfor} est disponible.\n" > ${PROMPT_TTY}
+	printf "    Appliquer cette mise à jour peut prendre plusieurs minutes.\n" > ${PROMPT_TTY}
+	printf "    Souhaitez-vous appliquer la mise à jour maintenant ? (o/n)\n" > ${PROMPT_TTY}
+	if [[ ${count} -gt 0 ]]; then
+		printf "${BAD}    Attention : l'application de cette mise à jour a déjà été refusée %d fois.\n    Elle sera appliquée automatiquement après %d refus\n" ${count} ${MAX_COUNT} > ${PROMPT_TTY}
+	fi
+	printf "${HILITE}\t " > ${PROMPT_TTY}
+	answer=$(timeout ${timeout} head -n 1 <${PROMPT_TTY})
+	local ret=$?
+	echo -n "${NORMAL}" > ${PROMPT_TTY}
+
+	if [[ ${ret} -ne 0 ]]; then
+		echo "${HILITE}    Délai d'attente dépassé, la mise à jour va être appliquée automatiquement." > ${PROMPT_TTY}
+		sleep 1
+		echo -n '0' > "${COUNT_FILE}"
+		reset_con
+		return 0
+	fi
+
+	case "${answer}" in
+		"o"|"O"|"oui"|"Oui")
+			echo "${HILITE}    La mise à jour va maintenant être appliquée." > ${PROMPT_TTY}
+			sleep 1
+			echo -n '0' > "${COUNT_FILE}"
+			reset_con
+			return 0
+			;;
+		"n"|"N"|"non"|"Non")
+			echo "${HILITE}    La mise à jour ne sera pas appliquée immédiatement, le démarrage se poursuit." > ${PROMPT_TTY}
+			sleep 1
+			let "count+=1"
+			echo -n "${count}" > "${COUNT_FILE}"
+			reset_con
+			return 1
+			;;
+		*)
+			echo "${BAD}    Choix non supporté : ${HILITE}${answer}${NORMAL}" > ${PROMPT_TTY}
+			sleep 2
+			if [[ ${READ_TRIES} -ge ${MAX_TRIES} ]]; then
+				echo "${HILITE}    Nombre maximal de saisies dépassé, la mise à jour va être appliquée automatiquement" > ${PROMPT_TTY}
+				sleep 1
+				echo -n '0' > "${COUNT_FILE}"
+				reset_con
+				return 0
+			else
+				let "READ_TRIES+=1"
+				confirm_upgrade "${whatfor}"
+			fi
+			;;
+	esac
+}
+
+

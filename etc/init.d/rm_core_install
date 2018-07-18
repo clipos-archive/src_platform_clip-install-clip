@@ -1,0 +1,151 @@
+#!/sbin/runscript
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+# Copyright 2009 SGDN/DCSSI
+# Copyright 2010-2014 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# All rights reserved
+
+description="Update RM jail cores"
+
+depend() {
+	need localmount jail_init
+	after clip_apps_install
+	before clip_servers
+	keyword -timeout
+}
+
+# Check optional 'update available' flag
+# Returns 0 (proceed to update) if either flag is present, or 
+# clip_install / clip_download are not up to date enough to manage it properly.
+# Returns 1 (stop right there) otherwise.
+check_flag() {
+	local jail="${1}"
+
+	local flagdir="/vservers/${jail}/update_priv/var/pkg/mirrors/flags"
+	local flagfile="${flagdir}/rm_core"
+	local flagforce="${flagfile}.force"
+
+	# Dir is not present - we need to run clip_install to know if an
+	# update is available
+	[[ -d "${flagdir}" ]] || return 0
+	# Forced check after clip-core upgrade
+	[[ -e "${flagforce}" ]] && return 0
+	# Dir is present, flag is not there - no update available
+	[[ -e "${flagfile}" ]] || return 1
+	# Flag is present, update available
+	return 0
+}
+
+get_addr_string() {
+        local jail="$1"
+        local addr=""
+	jail="${jail^^}"
+	local var="${jail/_/}_LOCAL_ADDR"
+	addr="${!var}"
+	if [[ -z "${addr}" ]]; then
+		ewarn "Invalid jail name ${server}"
+		return 1
+	fi
+	echo "${addr}/255.255.255.255"
+}
+
+import_conf() {
+	source "/etc/conf.d/jail-net"
+	source "/lib/clip/jails.sub"
+	source "/etc/conf.d/clip"
+
+	UPDATE_SPLASH_VERBOSE=""
+}
+
+update_jail() {
+	local jail="${1}"
+	local jailname="${2}"
+	local bjail="${jail##secure_update_}"
+	local script="/vservers/${bjail}/update_root/usr/bin/_clip_install"
+	[[ -e "${script}" ]] || script="/vservers/${bjail}/update_root/usr/bin/clip_install";
+
+	if grep -q 'Interactive' "${script}"; then
+		vsctl "${jail}" enter -- /usr/bin/clip_install -d rm -p core -c
+		local -i ret=$?
+		[[ $ret -eq 5 ]] || return $ret
+	
+		clear
+		[[ -n "${UPDATE_SPLASH_VERBOSE}" ]] || splash "verbose"
+		UPDATE_SPLASH_VERBOSE="yes"
+
+		printf "${GOOD}Une mise à jour des paquetages essentiels est disponible pour ${jailname}${NORMAL}\n"
+		printf "${HILITE}Veuillez patienter pendant l'application des mises à jour${NORMAL}\n\n"
+	
+		vsctl "${jail}" enter -- /usr/bin/clip_install -d rm -p core -I
+		ret=$?
+		sleep 1
+		return $ret
+	else 
+		vsctl "${jail}" enter -- /usr/bin/clip_install -d rm -p core 
+		return $?
+	fi
+}
+
+update_busybox() {
+	local jail="${1}"
+	local bbpath="/vservers/${jail}/bin/busybox"
+
+	cmp -s "/sbin/busybox-rm" "${bbpath}" && return 0
+
+	if ! cp -p "/sbin/busybox-rm" "${bbpath}"; then
+		ewarn "Failed to update busybox in ${jail}"
+		return 1
+	fi
+}
+
+setup_jail() {
+	local jail="${1}"
+	local -i ret=0
+
+	update_busybox "${jail}"
+	
+	if ! check_flag "${jail}"; then
+		rm -f "/vservers/${jail}/update_priv/var/run/log"
+		return 0
+	fi
+
+	local update_jail="secure_update_${jail}"
+	local addr="$(get_addr_string "${jail}")"
+
+	if [[ -z "${addr}" ]] ; then
+		ewarn "Could not get address string for ${update_jail}"
+		return 1
+	fi
+	# Create a mountpoint for the syslog socket (first boot)
+	if [[ ! -e "/vservers/${jail}/update_root/log" ]]; then
+		:>"/vservers/${jail}/update_root/log"
+	fi
+
+	einfo "   in ${jail}"
+
+	jail_setup_wait "${update_jail}" -a "${addr}" || return 1
+	vsctl "${update_jail}" enter -- /bin/cleanup_log.sh || ret=1
+	update_jail "${update_jail}" "${jail}" || ret=1
+	jail_terminate "${update_jail}" || ret=1
+	rm -f "/vservers/${jail}/update_priv/var/run/log"
+
+	return $ret
+}
+
+start() {
+	local -i ret=0
+	
+	import_conf
+
+	local jail
+
+	ebegin "Checking for RM core updates"
+	for jail in ${CLIP_JAILS}; do
+		setup_jail "${jail}" || ret=1
+		local flagforce="/vservers/${jail}/update_priv/var/pkg/mirrors/flags/rm_core.force"
+		[[ -e "${flagforce}" ]] && rm -f "${flagforce}"
+	done
+	[[ -n "${UPDATE_SPLASH_VERBOSE}" ]] && splash "silent"	
+	eend $ret
+}

@@ -1,0 +1,801 @@
+#!/usr/bin/perl
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+
+#######################################################################
+# clip_install_clip-core - upgrade CLIP core.
+# Copyright (C) 2008-2009 SGDN/DCSSI
+# Copyright (C) 2010-2014 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+#
+# All rights reserved.
+#######################################################################
+
+
+use strict;
+use warnings;
+use Getopt::Long;
+use CLIP::Pkg::Base ':all';
+use CLIP::Pkg::Install ':all';
+use CLIP::Pkg::Download ':all';
+use CLIP::Conf::Base ':all';
+use CLIP::Mount ':all';
+
+use CLIP::Logger ':all';
+use Sys::Syslog qw(:macros);
+
+###############################################################
+#                    Global vars                              #
+###############################################################
+
+###### Main options ######
+my @g_rm_jails = ();
+
+$g_log_syslog = 1;
+
+$g_log_debug = 0;
+
+# 1: check and exit, 0: install, don't check
+my $g_check = 0;
+
+$CLIP::Logger::g_facilities->{"warn"} = LOG_LOCAL7;
+$CLIP::Logger::g_facilities->{"log"} = LOG_LOCAL7;
+
+###### Paths ######
+
+$CLIP::Pkg::Base::g_prefix_key = "/update_root";
+
+$g_log_prefix = "clip_install_clip_core";
+
+my $g_altroot = "/altroot"; 
+
+# device numbers
+my $g_home_devnum = 2;
+my $g_log_devnum = 3;
+
+my $g_root_disk = ""; # To be read from /proc/cmdline
+my $g_root_disk_nocrypt = ""; # To be read from /proc/cmdline
+my $g_root_devnum = 0; # To be read from /proc/cmdline
+my $g_boot_device = ""; # To be read from /proc/cmdline
+my $g_altroot_devnum = 0; # To be read from /proc/cmdline
+
+my $g_alt_rootdevs = {
+	'5'	=>	'10',
+	'10'	=>	'5',
+};
+
+# Mirrors to copy
+my $g_copy_mirrors = {
+		"/var/pkg"				=>	"clip",
+};
+
+# Flags to create to force update checks on next reboot
+my @g_mirror_flags = (
+	"/var/pkg/mirrors/flags/clip_apps.force",
+);
+
+# update paths
+my $g_dist = "clip";
+my $g_part = "core";
+my $g_conf_file = "/etc/admin/clip_install/clip_install_$g_dist"."_"."$g_part.conf"; 
+my $g_apt_config = "/update_root/etc/clip_update/clip_install/apt.conf.$g_dist.$g_part";
+my $g_state_dir = "/var/clip_install_$g_dist"."_".$g_part;
+my $g_sources_list = "";
+my $g_mirror_dir = "";
+my $g_lock_file = "";
+my $g_update_lock_file = "";
+my $g_boot_file = "/var/clip_install_boot.lck";
+
+$CLIP::Pkg::Base::g_pkg_opts->{'Distribution'} = $g_dist;
+$CLIP::Pkg::Base::g_pkg_opts->{'Priority'} = "Required";
+$CLIP::Pkg::Base::g_optional_pkg_files = [];
+
+###### Upgrade options ######
+
+# Updated from config file
+$CLIP::Pkg::Base::g_pkg_opts->{'Impact'} = 0;
+
+# Global configuration options
+$CLIP::Pkg::Base::g_conf_opts = {
+	rej_young		=> 0,	
+	rej_old			=> 0,
+	rej_older		=> 0,	
+};
+
+###### Upgrade conf files to mask on alt tree ######
+my $g_backup_list = "/etc/admin/clip_install/backup_list.txt";
+my $g_conffiles_list = "/etc/admin/clip_install/conffiles.list";
+my $g_netconf_base = "/etc/admin/netconf.d";
+my $g_ike2_certdir = "/etc/admin/ike2/cert";
+
+################################################################
+#                     Subs                                     #
+################################################################
+
+##### Helpers: create missing destination paths on altroot as needed
+
+sub create_one_data_path($);
+
+# Create a destination path (given $path, creates /altroot/$(basename $path),
+# whith proper perms / ownership) as needed.
+sub create_one_data_path($) {
+	my $path = shift;
+
+	# Chomp last path component
+	return 1 unless ($path =~ s/\/[^\/]+$//);
+
+	my $dpath = "$g_altroot$path";
+	return 1 if (-d $dpath);
+
+	# Recurse : create parent dir if needed
+	return 0 unless create_one_data_path($path);
+
+	my @st = stat($path);
+
+	my $mode = sprintf("%04o", $st[2] & 07777);
+	my $uid = $st[4];
+	my $gid = $st[5];
+
+	my @cmd = ("install", "-d", "-g", $gid, "-o", $uid, "-m", $mode, $dpath);
+	if (system(@cmd) == 0) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+# Create all missing destination paths for a list of files to copy to $g_altroot
+sub create_data_paths($) {
+	my $list = shift;
+	my $ret = 1;
+
+	foreach my $path (@{$list}) {
+		chomp $path;
+		create_one_data_path($path) or $ret = 0;
+	}
+
+	return $ret;
+}
+
+###### Replace / rollback ######
+
+# This avoids most temporary copies that might be leftover in case of interruption
+
+sub replace_files($) {
+	my $list = shift;
+
+	# Create data paths as needed, won't be rolled-back in case of failure
+	return 0 unless create_data_paths($list);
+
+	my @replaced = ();
+	foreach my $file (@{$list}) {
+		# We should not touch RM conf files, since RM jails are now
+		# shared between both CLIP installs.
+		# This is just a sanity check - we don't expect any such file
+		# to crop up here, since we no longer read RM conffiles.list.
+		if ($file =~ /^\/vservers\/rm_/) {
+			clip_warn "Skipping RM conf file : $file";
+			next;
+		}
+		if (-e "$g_altroot$file.bck") {
+			clip_warn "$g_altroot$file.bck exists, will roll it back before replacing";
+			goto ERR unless clippkg_rollback("$g_altroot$file");
+		}
+		goto ERR unless clippkg_replace($file, "$g_altroot$file");
+		unshift @replaced, ($file);
+	}
+
+	return 1;
+ERR:
+	foreach my $file (@replaced) {
+		clippkg_rollback("$g_altroot$file"); # No error handling
+		next;
+	}
+	return 0;
+}
+
+sub clean_files($) {
+	my $list = shift;
+	my $ret = 1;
+
+	foreach my $file (@{$list}) {
+		if ($file =~ /^\/vservers\/rm_/) {
+			clip_warn "Skipping RM conf file : $file";
+			next;
+		}
+		clippkg_clean("$g_altroot$file") or $ret = 0;
+	}
+
+	return $ret;
+}
+
+sub rollback_files($) {
+	my $list = shift;
+	my $ret = 1;
+
+	foreach my $file (@{$list}) {
+		if ($file =~ /^\/vservers\/rm_/) {
+			clip_warn "Skipping RM conf file : $file";
+			next;
+		}
+		clippkg_rollback("$g_altroot$file") or $ret = 0;
+	}
+
+	return $ret;
+}
+
+sub _list_data_files() {
+	my @files = ();
+	foreach my $file ($g_backup_list, $g_conffiles_list) {
+		if (not open IN, "<", "$file") {
+			clip_warn "failed to open $file";
+			return undef;
+		}
+		push @files, <IN>;
+		close IN;
+	}
+	my @netconfs = <$g_netconf_base/*>;
+	foreach my $conf (@netconfs) {
+		push @files, ($conf) if -d $conf;
+	}
+
+	my @ikefiles = <$g_ike2_certdir/*>;
+	foreach my $conf (@ikefiles) {
+		push @files, ($conf) if -f $conf;
+	}
+
+
+	my @files_ok = map {chomp; $_} @files;
+
+	return \@files_ok;
+}
+
+sub replace_data() {
+	my $files;
+
+	return 0 if (not defined($files = _list_data_files()));
+
+	return replace_files($files);
+}
+		
+sub clean_data() {
+	my $files;
+
+	return 0 if (not defined($files = _list_data_files()));
+
+	return clean_files($files);
+}
+
+sub rollback_data() {
+	my $files;
+
+	return 0 if (not defined($files = _list_data_files()));
+
+	return rollback_files($files);
+}
+
+###### Mount / umount ######
+
+# do mounts, and return list of mountpoints, in order
+sub do_mounts() {
+	my $dev = $g_altroot_devnum;
+	
+	my $mountlist = [
+		[ "$g_root_disk$dev", "$g_altroot", undef, undef ],
+
+		[ "$g_root_disk_nocrypt$g_home_devnum", "$g_altroot/home", undef, "nodev,noexec,nosuid" ],
+		[ "$g_boot_device", "$g_altroot/boot", undef, "nodev,noexec,nosuid" ],
+		[ "tmpfs", "$g_altroot/tmp", "tmpfs", "nodev,noexec,nosuid,mode=1777" ],
+		[ "/proc", "$g_altroot/proc", undef, "bind,noexec,nosuid,nodev" ],
+		[ "/dev", "$g_altroot/dev", undef, "bind,noexec,nosuid" ],
+
+		[ "$g_root_disk".($dev+1), "$g_altroot/mounts", undef, undef ],
+		[ "$g_altroot/mounts/var", "$g_altroot/var", undef, "bind,nodev,nosuid" ],
+		[ "$g_root_disk$g_log_devnum", "$g_altroot/var/log", undef, "nodev,noexec,nosuid" ],
+		
+		[ "$g_altroot/mounts/usr", "$g_altroot/usr/local", undef, "bind,nodev,noexec" ],
+		[ "$g_altroot/home/etc.users/core", "$g_altroot/etc/core", undef, "bind,nodev,noexec,nosuid" ],
+		[ "$g_altroot/home/etc.users/tcb", "$g_altroot/etc/tcb", undef, "bind,nodev,noexec,nosuid" ],
+		[ "$g_altroot/mounts/admin_priv/etc.admin", "$g_altroot/etc/admin", undef, "bind,nodev,noexec,nosuid" ],
+		[ "$g_altroot/mounts/admin_priv/etc.ike2", "$g_altroot/etc/admin/ike2", undef, "bind,nodev,noexec,nosuid" ],
+	];
+
+	# We bind mount the current RM jails to /altroot, since RM jails are shared between both installs
+	foreach my $jail (@g_rm_jails) {
+		push @{$mountlist}, (
+			[ "/vservers/$jail", "$g_altroot/vservers/$jail", undef, "bind,nodev,noexec,nosuid" ],
+			[ "/vservers/$jail/admin_priv/etc.admin", "/vservers/$jail/update_root/etc/admin", undef, "bind,nodev,noexec,nosuid" ],
+			[ "$g_altroot/vservers/$jail/admin_priv/etc.admin", "$g_altroot/vservers/$jail/update_root/etc/admin", undef, "bind,nodev,noexec,nosuid" ],
+		);
+	}
+
+	if (not clipmount_mount_all($mountlist)) {
+		clip_warn "failed to mount alternate clip tree";
+		return undef;
+	}
+	my @mounts = ();
+	foreach my $tuple (@{$mountlist}) {
+		push @mounts, (${$tuple}[1]);
+	}
+
+	return \@mounts;
+}
+
+sub do_umounts($) {
+	return clipmount_umount_all(shift);
+}
+
+###### Boot ######
+sub get_default_bootdev() {
+	if (not -e "/altroot/boot/extlinux.conf") {
+		clip_warn "/boot/extlinux.conf does not exist";
+		return undef;
+	}
+
+	my $link;
+	if (-l "/altroot/boot/extlinux.conf") {
+		if (not defined ($link = readlink "/altroot/boot/extlinux.conf")) {
+			clip_warn "failed to read link: /altroot/boot/extlinux.conf";
+			return undef;
+		}
+	} else {
+		open my $file, '<', "/altroot/boot/extlinux.conf" or (clip_warn "cannot open /altroot/boot/extlinux.conf" and return undef);
+		$link = <$file>;
+		close $file;
+	}
+
+	if ($link =~ /^extlinux_(\d+).conf$/) {
+		return $1;
+	} else {
+		clip_warn "invalid boot link: $link";
+		return undef;
+	}
+}
+
+sub update_boot() {
+	my $link = "extlinux_$g_altroot_devnum.conf";
+
+	# No error here !
+	unlink "/altroot/boot/extlinux.conf"
+		or clip_warn "failed to unlink /altroot/boot/extlinux.conf, trying to create new file anyway";
+	
+	open my $file, ">", "/altroot/boot/extlinux.conf";
+	print $file "include $link";
+	close $file;
+
+	return 1;
+}
+
+
+###### Upgrade ######
+
+sub check_upgrade() {
+	# Note: we call check_upgrade with the $stop_nomatch argument set,
+	# which means we will reject possible upgrades if any of their packages
+	# fail the checks. Thus we avoid useless upgrade tries. However, this
+	# only works reliably (without rejecting valid upgrades) if only one 
+	# configuration is installed in the core (which is always the case at the time 
+	# of writing this code...)
+	return clippkg_check_upgrade($g_mirror_dir, $g_dist, 1, 0);
+}
+
+# Return 0 on error, 1 on success (no upgrade performed), 2 on success (upgrade performed)
+sub chroot_upgrade() {
+	my $cmd = "/usr/bin/clip_install -d $g_dist -p $g_part -nolock -F -root $g_altroot";
+
+	my @output = ();
+	open PIPE, "$cmd 2>&1 |";
+	while (<PIPE>) {
+		push @output, ($_);
+		next if (not /has been/);
+		print "$_";
+		clip_log "$_";
+	}
+	close PIPE;
+	if ($?) {
+		clip_warn "chrooted upgrade failed";
+		foreach (@output) {
+			clip_warn "chroot command output: $_";
+		}
+		return 0;
+	} elsif ($output[-1] =~ /: upgrade complete/) {
+		clip_log "upgrade performed on alternate CLIP tree";
+		return 2;
+	} else {
+		foreach (@output) {
+			clip_log "chroot command output: $_";
+		}
+		clip_log "no upgrade performed on alternate CLIP tree";
+		return 1;
+	}
+}
+
+sub update_mirrors() {
+	foreach my $src (keys %{$g_copy_mirrors}) {
+		my $dist = $g_copy_mirrors->{$src};
+
+		clip_log "updating $dist mirror at $src";
+		clippkg_gen_mirror("$g_altroot$src", $dist, "$src/mirrors/$dist", 1, undef)
+			or clip_warn "failed to update mirror at $src";
+	}
+
+	foreach my $flag (@g_mirror_flags) {
+		if (open OUT, ">", "$g_altroot$flag") {
+			print OUT "Forced upgrade check on reboot";
+			close OUT;
+		} else {
+			clip_warn "failed to create flag $g_altroot$flag";
+		}
+	}
+}
+
+sub finish_upgrade() {
+	my $dbdev = "";
+	my $boot_file_p = 0;
+
+	if (defined($dbdev = get_default_bootdev())) {
+		if (open OUT, ">", $g_boot_file) {
+			print OUT "$dbdev";
+			close OUT;
+			$boot_file_p = 1;
+		} else {
+			clip_warn "failed to write $g_boot_file";
+		}
+	} else {
+		clip_warn "failed to get default boot device, trying to finish upgrade anyway";
+	}
+	clean_data();
+	update_mirrors(); # Do not let mirror update errors stop us.
+
+	# The mirror update will have automatically created a 'clip_core' flag,
+	# but since the updated version of clip-core in the mirror is the one
+	# we just installed, we might as well remove the flag.
+	my $flag = "$g_altroot/var/pkg/mirrors/flags/clip_core";
+	if (-e $flag) {
+		unlink $flag or clip_warn "failed to remove flag $flag";
+	}
+	$flag = "/var/pkg/mirrors/flags/clip_core";
+	if (-e $flag) {
+		unlink $flag or clip_warn "failed to remove flag $flag";
+	}
+
+	if (not update_boot()) {
+		clip_warn "boot loader NOT updated";
+		return 0;
+	} else {
+		clip_log "boot loader updated, new boot device is $g_root_disk$g_altroot_devnum";
+		if ($boot_file_p) {
+			unlink $g_boot_file
+				or clip_warn "failed to remove $g_boot_file";
+		}
+		if (-e "$g_altroot/$g_boot_file") {
+			unlink "$g_altroot/$g_boot_file" 
+				or clip_warn "failed to remove $g_altroot/$g_boot_file";
+		}
+		return 1;
+	}
+}
+
+sub check_previous_upgrade() {
+	if (-f $g_boot_file) {
+		clip_log "detected previous upgrade, will try to update boot loader";
+		return finish_upgrade();
+	}
+	clip_warn "no previous upgrade detected";
+	return 0;
+}
+
+sub cleanup_boot_file() {
+	my $abf = "$g_altroot$g_boot_file";
+	return 1 if (not -f "$abf");
+	my $curdev;
+	my $dev = "";
+
+	if (not defined($curdev = get_default_bootdev())) {
+		clip_warn "failed to get default boot device";
+		return 0;
+	}
+	if (open IN, "<", $abf) {
+		$dev = <IN>;
+		close IN;
+	} else {
+		clip_warn "failed to open $abf";
+		# remove it anyway...
+	}
+	
+	if ($dev ne $curdev) {
+		clip_log "removing out-of-date $abf";
+		if (not unlink "$abf") {
+			clip_warn "failed to unlink $abf";
+			return 0;
+		}
+	} 
+	return 1;
+}
+
+###### Command line ######
+
+sub usage($) {
+	my $fh = shift;
+
+	print $fh "clip_install_clip_core - upgrade clip core\n";
+	print $fh "options:\n";
+	print $fh "   -h[elp]      : print this help and exit\n";
+	print $fh "   -V[erbose]   : be more verbose\n";
+}
+
+sub merror($) {
+	my $msg = shift;
+
+	clip_warn $msg;
+	exit 1;
+}
+
+sub get_options() {
+	eval {
+		GetOptions (
+			'check'		=>	\$g_check,
+			'help'		=>	sub {usage(*STDOUT{IO}); exit 0},
+			'Verbose'	=>	\$g_log_debug,
+		) or die 1;
+	};
+
+	return 0 if ($@);
+
+
+	return 1;
+}
+
+sub check_option_files() {
+	merror "missing install config file $g_apt_config"
+					unless (-f $g_conf_file);
+	merror "missing apt config file $g_apt_config"
+					unless (-f $g_apt_config);
+
+}
+
+sub read_mirror_path() {
+	open IN, "<", "$g_sources_list"
+		or merror "Could not open $g_sources_list";
+
+	my @lines = <IN>;
+	close IN;
+
+	foreach my $line (@lines) {
+		next if (not $line =~ /^deb/);
+
+		$line =~ /^deb\s+copy:\/\/(\/\S+)\s/
+			or merror "Invalid sources.list line: $line";
+		my $tmp = $1;
+		$tmp =~ s/\/mirrors$//;
+		if ($g_mirror_dir) {
+			clip_warn "multiple definitions of mirror dir: "
+					."overriding $g_mirror_dir with $tmp";
+		}
+
+		$g_mirror_dir = $tmp;
+	}
+	merror "no definition for mirror dir" unless ($g_mirror_dir);
+}
+
+sub get_rm_config() {
+	open IN, "<", "/etc/conf.d/clip" or merror "could not open /etc/conf.d/clip";
+	my @lines=<IN>;
+	close IN;
+
+LOOP:
+	foreach my $line (@lines) {
+		if ($line =~ /^CLIP_JAILS=(?:\")?([^\"]+)(?:\")?/) {
+			@g_rm_jails = split " ", $1;
+			last LOOP;
+		}
+	}	
+
+	# No mirror copy for RM jails, since we use the same RM jails for both 
+	# CLIP installs
+	foreach my $jail (@g_rm_jails) {
+		#$g_copy_mirrors->{"/vservers/$jail/update_priv/var/pkg"} = "rm";
+		push @g_mirror_flags, 
+			("/vservers/$jail/update_priv/var/pkg/mirrors/flags/rm_core.force",
+			 "/vservers/$jail/update_priv/var/pkg/mirrors/flags/rm_apps.force");
+			 
+	}
+}
+
+sub get_config() {
+	my $tmp; 
+
+	## Configuration dates ##
+	if (defined ($tmp = clip_import_conf($g_conf_file, "option_install_high_impact_packages", "yes|no"))) {
+		if ($tmp eq "yes") {
+			$CLIP::Pkg::Base::g_pkg_opts{'Impact'} = 1;
+		} else  {
+			$CLIP::Pkg::Base::g_pkg_opts{'Impact'} = 0;
+		}
+	} 
+
+	if (defined ($tmp = clip_import_conf($g_conf_file, "verbose", "yes|no"))) {
+		if ($tmp eq "yes") {
+			$g_log_debug = 1;
+		}
+	}
+
+	## Apt / dpkg paths ##
+	# Relaxed regexps, these are trusted files
+	if (not defined ($tmp = clip_import_conf_sep($g_apt_config, "Dir::Cache", "\\S+", " "))) {
+		merror "could not read apt cache path";
+	} else {
+		$tmp =~ s/["";]//g;
+		$CLIP::Pkg::Install::g_apt_cache_dir = $tmp;
+	}
+
+	if (not defined ($tmp = clip_import_conf_sep($g_apt_config, "Dir::State::Status", "\\S+", " "))) {
+		merror "could not read dpkg admin path";
+	} else {
+		$tmp =~ s/["";]//g;
+		$tmp =~ s/\/status$//;
+		$CLIP::Pkg::Base::g_dpkg_admin_dir = $tmp;
+	}
+
+	if (not defined ($tmp = clip_import_conf_sep($g_apt_config, "Dir::Etc::SourceList", "\\S+", " "))) {
+		merror "could not read sources.list path";
+	} else {
+		$tmp =~ s/["";]//g;
+		$g_sources_list = $tmp;
+	}
+
+	read_mirror_path();
+
+	get_rm_config();
+
+	$g_lock_file="$g_mirror_dir/lock";
+	$g_update_lock_file="$g_mirror_dir/clip_update.lck";
+}
+
+sub check_config_files() {
+	merror "no mirror directory: $g_mirror_dir" unless (-d $g_mirror_dir);
+	merror "no cache directory: $CLIP::Pkg::Install::g_apt_cache_dir"
+		unless (-d $CLIP::Pkg::Install::g_apt_cache_dir);
+	merror "no dpkg admin dir $CLIP::Pkg::Base::g_dpkg_admin_dir" 
+		unless (-d $CLIP::Pkg::Base::g_dpkg_admin_dir);
+}
+
+sub read_root_devnum() {
+	my $root;
+	if (not defined ($root = clipmount_rootdev())) {
+		merror "failed to read root device path";
+	}
+
+	if ($root =~ /^(\/\S+\D)(\d+)$/) {
+		$g_root_disk = $1;
+		$g_root_disk_nocrypt = $1;
+		$g_root_devnum = $2;
+	} else {
+		merror "failed to parse root device path";
+	}
+
+	$g_root_disk =~ s/^\/dev/\/dev\/mapper/ if (clipmount_encrypted_root());
+
+	if (not defined($g_boot_device = clipmount_bootdev())) {
+		merror "failed to read boot device path";
+	}
+	if (not defined($g_altroot_devnum = $g_alt_rootdevs->{$g_root_devnum})) {
+		merror "unsupported root device number: $g_root_devnum";
+	}
+}
+
+
+###############################################################
+#                    Main                                     #
+###############################################################
+
+clip_logger_init;
+clip_log "starting up";
+get_options or merror "failed to parse options";
+check_option_files;
+get_config;
+check_config_files;
+read_root_devnum;
+
+if (-e $g_update_lock_file) {
+	print " ! Manual lock prevented CLIP core upgrade\n";
+	merror "updates are locked for clip core, aborting";
+}
+
+my $lock;
+my $ret = 1;
+
+my $arch; 
+if (not defined($arch = clippkg_get_arch())) {
+	merror "could not get arch string, aborting";
+}
+
+$CLIP::Pkg::Install::g_arch = $arch;
+
+
+if (not defined ($lock = clippkg_lock($g_lock_file))) {
+	merror "could not lock $g_lock_file, aborting";
+}
+
+$ENV{'APT_CONFIG'} = $g_apt_config;
+$ENV{'BOOTSTRAP_NOVERIEXEC'} = "yes";
+
+my $mounts;
+if (not defined($mounts = do_mounts())) {
+	clip_warn "failed to mount alternate CLIP tree, aborting";
+	goto OUT;
+}
+
+cleanup_boot_file();
+
+if ($g_check) {
+	my $avail = check_upgrade();
+	if (not $avail) {
+		clip_warn "could not check for available core upgrades";
+		goto OUT_UMOUNT;
+	}
+
+	if ($avail == 1) {
+		clip_log "no core upgrade available";
+		$ret = 0;
+		goto OUT_UMOUNT;
+	}
+
+	if ($avail == 2) {
+		clip_log "core upgrade available";
+		$ret = 5;
+		goto OUT_UMOUNT;
+	}
+
+	clip_warn "unexpected check_upgrade() result: $avail";
+	goto OUT_UMOUNT;
+}
+# else ...
+# We're in business...
+
+if (not replace_data()) {
+	clip_warn "failed to copy local data, aborting";
+	goto ERR_DATA;
+}
+
+my $upgrade = chroot_upgrade();
+clip_warn "failed to chdir() back to /, some umounts may fail"
+	if (not chdir "/");
+
+if (not $upgrade) {
+	clip_warn "chrooted upgrade failed, aborting";
+	goto ERR_DATA;
+} elsif ($upgrade == 1) {
+	# This is an error, based on the checks we perform before
+	# upgrading. The only legitimate way this could have happened
+	# is if a previous upgrade was completed on alternate CLIP,
+	# but the bootloader was not updated.
+	clip_warn "upgrade was not necessary";
+	check_previous_upgrade() or goto ERR_DATA;
+} else {
+	print " * Core upgrade successful, copying mirrors and rebooting...\n";
+	if (not finish_upgrade()) {
+		goto ERR_DATA;
+	}
+}
+
+print " * Core upgrade complete, rebooting.\n";
+clip_log "core upgrade complete";
+$ret = 5;
+unlink "/usr/local/var/core_avail" 
+	or clip_warn "failed to unlink /usr/local/var/core_avail";
+
+
+OUT_UMOUNT:
+clip_warn "failed to chdir() back to /, some umounts may fail"
+	if (not chdir "/");
+do_umounts($mounts);
+OUT:
+clippkg_unlock($lock, $g_lock_file);
+exit $ret;
+
+ERR_DATA:
+rollback_data();
+goto OUT_UMOUNT;
+	
+

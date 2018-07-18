@@ -1,0 +1,6 @@
+Dir::Etc "/mounts/admin_priv/etc.admin/clip_install";
+Dir::Etc::SourceList "/update_root/etc/clip_update/clip_install/sources.list.clip.core";
+Dir::Etc::Preferences "/mounts/admin_priv/etc.admin/clip_install/preferences.clip";
+Dir::Cache "/mounts/var/pkg/cache/apt/clip_install/clip/core";
+Dir::State "/mounts/var/pkg/cache/apt/clip_install/clip/core";
+Dir::State::Status "/mounts/var/pkg/lib/dpkg/status";

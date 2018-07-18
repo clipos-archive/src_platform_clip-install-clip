@@ -1,0 +1,13 @@
+Dir::Etc "/mounts/admin_priv/etc.admin/clip_install";
+Dir::Etc::SourceList "/update_root/etc/clip_update/clip_install/sources.list.clip.core";
+Dir::Etc::Preferences "/mounts/admin_priv/etc.admin/clip_install/preferences.clip";
+Dir::Cache "/altroot/mounts/var/pkg/cache/apt/clip_install/clip/core";
+Dir::State "/altroot/mounts/var/pkg/cache/apt/clip_install/clip/core";
+Dir::State::Status "/altroot/mounts/var/pkg/lib/dpkg/status";
+DPkg
+{
+  Options {
+  	"--root";
+	"/altroot";
+	}
+};

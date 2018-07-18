@@ -1,0 +1,52 @@
+.TH CLIP_INSTALL_CLIP_CORE 8
+.SH NAME
+clip_install_clip_core \- Clip cross-installer.
+.SH SYNOPSIS
+.B clip_install_clip_core
+[\-hv]
+.SH DESCRIPTION
+Updates CLIP core packages on the other partitions set if major updates are available.
+It's intended to be run non-interactively and MUST be run on startup.
+This installer retrieves the current partition set and mounts the other one.
+It updates packages on the mounted partitions set using 
+.BR clip_install (8)
+ and then updates the
+.BR /boot
+partition.
+The 
+.BR /home
+partition is also copied.
+This utility installs the vservers utility but not the vservers themselves.
+
+Before cross-installing CLIP, the second partitions set MUST have been installed by the 
+.BR debootstrap
+method.
+If the installation succeeds, the computer reboots on the new system.
+.SH OPTIONS
+.IP \-h
+Prints help and exit
+.IP \-v
+Prints version of the utility
+.SH RESOURCES
+.PP Depends on 
+.BR sh (1)
+,
+.BR awk (1)
+,
+.BR sed (1)
+,
+.BR find (1)
+,
+.BR apt-cache (8)
+, 
+.BR apt-get (8)
+and
+.BR clip_install (8)
+.SH DIAGNOSTICS
+The script returns 1 if an error occured.
+The script return 0 if no errors encountered but no upgrading done.
+The script return 5 if no errors encountered and upgrading done (thus reboot is necessary).
+.SH AUTHORS
+EADS Defence And Security Systems
+.SH SEE ALSO
+.BR clip_install (8) 

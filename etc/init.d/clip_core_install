@@ -1,0 +1,176 @@
+#!/sbin/runscript
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+# Copyright 2009 SGDN/DCSSI
+# Copyright 2011-2014 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# All rights reserved
+
+description="Check and apply available updates for CLIP core"
+
+depend() {
+	need localmount logger
+	keyword -timeout
+}
+
+invert_bootdev() {
+	local cur=""
+
+	if [[ -L "/boot/extlinux.conf" ]]; then
+		cur="$(readlink "/boot/extlinux.conf")"
+	else
+		local _cur="$(cat "/boot/extlinux.conf")"
+		cur=${_cur#include }
+	fi
+
+	local new
+
+	case ${cur} in
+		extlinux_5.conf)
+			new="extlinux_10.conf"
+			;;
+		extlinux_10.conf)
+			new="extlinux_5.conf"
+			;;
+		*)
+			ewarn "Unexpected extlinux.conf target: ${cur}"
+			return 1
+			;;
+	esac
+
+	echo "include ${new}" >> /boot/extlinux.conf.new || return 1
+	mv "/boot/extlinux.conf.new" "/boot/extlinux.conf" || return 1
+
+	# Lock out core update checking until a new config is downloaded
+	:>"/var/pkg/clip_core_noupdate"
+}
+
+confirm_invert() {
+	chvt ${PROMPT_TTYNUM}
+	do_clear
+
+	printf "${GOOD}    Vous avez démarré sur l'installation CLIP alternative\n" > ${PROMPT_TTY}
+	printf "      (Choix \"CLIP, version précédente\" au démarrage)\n" > ${PROMPT_TTY}
+	printf "${HILITE}    Souhaitez-vous rétablir cette version comme version par défaut ? (o/n)\n" > ${PROMPT_TTY}
+	printf "${GOOD}    Répondre 'o' à cette question inversera automatiquement les choix\n" > ${PROMPT_TTY}
+	printf "${GOOD}    proposés au démarrage. Il n'est pas nécessaire de vous décider immédiatement,\n" > ${PROMPT_TTY}
+	printf "${GOOD}    la question vous sera posée à nouveau au prochain démarrage si vous répondez 'n'.\n" > ${PROMPT_TTY}
+
+	printf "${HILITE}\t " > ${PROMPT_TTY}
+	local answer
+	answer=$(timeout 30 head -n 1 <${PROMPT_TTY})
+	local -i ret=$?
+	echo -n "${NORMAL}" > ${PROMPT_TTY}
+
+	if [[ ${ret} -ne 0 ]]; then
+		echo "${WARN}    Délai d'attente dépassé, réponse 'n' utilisée par défaut" > ${PROMPT_TTY}
+		return 1
+	fi
+	
+	case "${answer}" in
+		"o"|"O"|"oui"|"Oui")
+			return 0
+			;;
+		"n"|"N"|"non"|"Non")
+			return 1
+			;;
+		*)
+			echo "${BAD}    Choix non supporté : ${HILITE}${answer}${NORMAL}" > ${PROMPT_TTY}
+			sleep 2
+			confirm_invert
+			return $?
+			;;
+	esac
+}
+
+do_invert() {
+	if ! confirm_invert; then
+		echo "${HILITE}    La configuration de démarrage sera conservée telle qu'elle." > ${PROMPT_TTY}
+		sleep 1
+		reset_con
+
+		splash 'silent'
+		return 0
+	fi
+
+	if invert_bootdev; then
+		echo "${HILITE}    La configuration de démarrage précédente a été rétablie." > ${PROMPT_TTY}
+		echo "${HILITE}    La version CLIP courante devient le choix par défaut." > ${PROMPT_TTY}
+	else
+		ewarn "${BAD}    La mise à jour de la configuration de démarrage a échoué." > ${PROMPT_TTY}
+	fi
+	sleep 3
+	reset_con
+}
+
+invert_check() {
+	grep -q 'oldclip' "/proc/cmdline" || return 0
+	
+	local dev="$(grep -o 'root=[^ ]*' "/proc/cmdline")"
+	dev="${dev#root=}"
+	dev="${dev%%[0-9]*}"
+	if [[ -z "${dev}" ]]; then
+		ewarn "failed to read boot device"
+		return 1
+	fi
+	if ! mount "${dev}1" "/boot"; then
+		ewarn "failed to mount /boot"
+		return 1
+	fi
+
+	clear
+	do_invert
+
+	splash 'silent'
+	if ! umount "/boot"; then
+		ewarn "failed to unmount /boot"
+		splash 'exit'
+		reboot
+	fi
+	return 0
+}
+
+start() {
+	DISABLE_FILE="/var/pkg/clip_core_noupdate"
+	COUNT_FILE="/var/clip_core_counter"
+	MAX_COUNT=5
+	source "/lib/rc/update/common"
+
+	invert_check # Errors are ignored
+
+	if [[ -f "${DISABLE_FILE}" ]]; then
+		einfo "Using older CLIP install for now, skipping core update check"
+		return 0
+	fi
+	ebegin "Checking for CLIP core updates"
+	local -i ret
+	clip_install_clip_core -check
+	ret=$?
+	if [[ ${ret} -ne 5 ]]; then
+	  einfo "No updates available"
+	  eend $ret
+	  return 0
+	fi
+
+	if !  confirm_upgrade "du coeur CLIP"; then
+		splash "silent"
+		return 0
+	fi
+
+	ebegin "Installing CLIP core updates"
+	clip_install_clip_core 
+	ret=$?
+	if [[ ${ret} -eq 5 ]]; then
+		einfo "CLIP core upgrade successful"
+		eend 0
+		splash 'exit'
+		reboot
+		return 0
+	fi
+	if [[ ${ret} -ne 0 ]]; then
+	  ewarn "clip_install_clip_core returned: ${result}"
+	  sleep 1
+	fi
+	splash "silent"
+	eend $ret
+}

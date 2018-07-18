@@ -1,0 +1,107 @@
+#!/sbin/runscript
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+# Copyright (C) 2009 SGDN/DCSSI
+# Copyright 2010-2014 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# All rights reserved
+
+description="Check and apply available updates for RM apps"
+
+depend() {
+	need localmount clip_servers jail_init
+	after rm_core_install
+	before xdm
+	keyword -timeout
+}
+
+# Check optional 'update available' flag
+# Returns 0 (proceed to update) if either flag is present, or 
+# clip_install / clip_download are not up to date enough to manage it properly.
+# Returns 1 (stop right there) otherwise.
+check_flag() {
+	local jail="${1}"
+
+	local flagdir="/vservers/${jail}/update_priv/var/pkg/mirrors/flags"
+	local flagfile="${flagdir}/rm_apps"
+	local flagforce="${flagfile}.force"
+
+	# Dir is not present - we need to run clip_install to know if an
+	# update is available
+	[[ -d "${flagdir}" ]] || return 0
+	# Forced check after clip-core upgrade
+	[[ -e "${flagforce}" ]] && return 0
+	# Dir is present, flag is not there - no update available
+	[[ -e "${flagfile}" ]] || return 1
+	# Flag is present, update available
+	return 0
+}
+
+
+update_jail() {
+	local jail="${1}"
+	local doit=""
+	local script="/vservers/${jail}/update_root/usr/bin/_clip_install"
+	local flagforce="/vservers/${jail}/update_priv/var/pkg/mirrors/flags/rm_apps.force"
+	[[ -e "${script}" ]] || script="/vservers/${jail}/update_root/usr/bin/clip_install";
+
+	[[ "${CONFIRMED}" == "no" ]] && return 0
+
+	if grep -q 'Interactive' "${script}"; then
+		vsctl "${jail}" enter -c /update -- /usr/bin/clip_install -d rm -p apps -c
+		local -i ret=$?
+		if [[ $ret -ne 5 ]]; then
+			[[ -e "${flagforce}" ]] && rm -f "${flagforce}"
+			return $ret
+		fi
+	
+		UPDATE_SPLASH_VERBOSE="yes"
+		COUNT_FILE="/var/${jail}_apps_counter"
+
+		if [[ "${CONFIRMED}" == "yes" ]]; then
+			doit="yes"
+		else
+		  	if confirm_upgrade "des paquetages secondaires ${jail}"; then
+				CONFIRMED="yes"
+				doit="yes"
+			else
+				CONFIRMED="no"
+			fi
+		fi
+		if [[ -n "${doit}" ]]; then
+			splash "verbose"
+			clear
+			printf "${HILITE}Veuillez patienter pendant l'application des mises à jour ${jail}${NORMAL}\n\n"
+			vsctl "${jail}" enter -c /update -- /usr/bin/clip_install -d rm -p apps -I
+			ret=$?
+			[[ -e "${flagforce}" ]] && rm -f "${flagforce}"
+			sleep 1
+			return $ret
+		else
+			return 0
+		fi
+	else
+		vsctl "${jail}" enter -c /update -- /usr/bin/clip_install -d rm -p apps
+		[[ -e "${flagforce}" ]] && rm -f "${flagforce}"
+	fi
+}
+
+start() {
+	local -i ret=0
+
+	UPDATE_SPLASH_VERBOSE=""
+	MAX_COUNT=5
+	source "/lib/rc/update/common"
+	CONFIRMED=""
+
+	source "/etc/conf.d/clip" || return 1
+
+	ebegin "Checking for RM apps updates"
+	for jail in ${CLIP_JAILS}; do
+		if check_flag "${jail}"; then
+			update_jail "${jail}" || ret=1
+		fi
+	done
+	[[ -n "${UPDATE_SPLASH_VERBOSE}" ]] && splash "silent"
+	eend $ret
+}

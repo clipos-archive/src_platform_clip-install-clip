@@ -1,0 +1,66 @@
+#!/sbin/runscript
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright © 2007-2018 ANSSI. All Rights Reserved.
+# Copyright 2009 SGDN/DCSSI
+# Copyright 2010-2014 SGDSN/ANSSI
+# Author: Vincent Strubel <clipos@ssi.gouv.fr>
+# All rights reserved
+
+description="Check and apply available updates for CLIP apps"
+
+depend() {
+	need localmount clip_update jail_init
+	after clip_core_install
+	keyword -timeout
+}
+
+# Check optional 'update available' flag
+# Returns 0 (proceed to update) if either flag is present, or 
+# clip_install / clip_download are not up to date enough to manage it properly.
+# Returns 1 (stop right there) otherwise.
+check_flag() {
+	local flagdir="/var/pkg/mirrors/flags"
+	local flagfile="${flagdir}/clip_apps"
+	local flagforce="${flagfile}.force"
+
+	# Dir is not present - we need to run clip_install to know if an
+	# update is available
+	[[ -d "${flagdir}" ]] || return 0
+	# Forced check after clip-core upgrade
+	[[ -e "${flagforce}" ]] && return 0
+	# Dir is present, flag is not there - no update available
+	[[ -e "${flagfile}" ]] || return 1
+	# Flag is present, update available
+	return 0
+}
+
+start() {
+	check_flag || return 0
+	local flagforce="/var/pkg/mirrors/flags/clip_apps.force"
+
+	COUNT_FILE="/var/clip_apps_counter"
+	MAX_COUNT=5
+	source "/lib/rc/update/common"
+
+	ebegin "Checking for CLIP apps updates"
+	vsctl update enter -- /usr/bin/clip_install -d clip -p apps -c
+	local -i ret=$?
+	if [[ $ret -ne 5 ]]; then
+		[[ -e "${flagforce}" ]] && rm -f "${flagforce}"
+		eend $ret
+		return $ret
+	fi
+	
+
+	if confirm_upgrade "des paquetages secondaires CLIP"; then
+		vsctl update enter -- /usr/bin/clip_install -d clip -p apps -I
+		ret=$?
+		[[ -e "${flagforce}" ]] && rm -f "${flagforce}"
+	else
+		ret=0
+	fi
+
+	splash "silent"
+
+	eend $ret
+}
